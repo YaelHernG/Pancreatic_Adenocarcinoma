@@ -1,0 +1,376 @@
+---
+title: "Mutations Signatures"
+author: "Paola Albarrán Godoy"
+date: "2025-05-08"
+output: html_document
+---
+
+# Mutations Signatures Analysis
+
+## 1. Input data reformatting
+```{r}
+rm(list = ls())
+# Load tidyverse collection of packages
+library(tidyverse)
+
+# Read cBioPortal style MAF file
+maf_cbioportal = read.delim('data_mutations.txt')
+
+# Selection of specific columns needed by SigProfiler
+maf_sp = maf_cbioportal %>%
+  select(Hugo_Symbol, Entrez_Gene_Id, Center, NCBI_Build, Chromosome,
+         Start_Position, End_Position, Strand, Variant_Classification,
+         Variant_Type, Reference_Allele, Tumor_Seq_Allele1,
+         Tumor_Seq_Allele2, dbSNP_RS, dbSNP_Val_Status, Tumor_Sample_Barcode)
+
+# Filter for only considering single base substitutions
+maf_sp = maf_sp %>%
+    filter(Variant_Type == 'SNP')
+
+
+```
+
+
+We will also create a specific folder for all our signature analysis results, as well as a specific folder inside for the updated MAF file, as this is also required by the SigProfiler tools.
+
+```{r}
+# Create new folder for signature analysis results
+dir.create('signatures')
+# Create new folder for updated MAF file (needed for SigProfilerMatrixGenerator)
+dir.create('signatures/SPMG/')
+
+# Write updated MAF file
+write.table(maf_sp, 'signatures/SPMG/data_mutations.maf', quote = F,
+            row.names = F, sep = '\t')
+```
+
+
+## 2. Generating mutational matrices
+
+Benefiting from the standard MAF format file we have generated, we can now use the SigProfilerMatrixGenerator package to manage this sequencing data. This package allows us to create a matrix classifying the mutations in the MAF file into the subtypes of interest.This package allows us to create a matrix classifying the mutations in the MAF file into the subtypes of interest. Mutational matrices are the first step for mutational signature analysis and correspond to a helpful data type, as they contain no protected information.
+
+In this case, we are going to focus on the SBS96 mutational context, which, as mentioned in the lecture, allows classifying single base substitutions in different categories based on the mutated nucleotide, as well as the immediately preceding and posterior nucleotides to the mutation (a.k.a. the 5’ and 3’ nucleotides from the mutation). Other contexts exist for single base substitutions, as well as additional variant types, such as doublet base substitutions (DBSs) or short insertions and deletions (indels; IDs).
+
+```{r}
+# Load reticulate library (for using python packages in R)
+library(reticulate)
+
+# Fixing conda environment (check optional section for details)
+use_condaenv('mutational_signatures')
+
+# Load R wrapper package for SigProfilerMatrixGenerator
+library(SigProfilerMatrixGeneratorR) # Esta función nos va a permitir convertir las variantes somáticas (mutaciones), en matrices de firmas mutacionales, las cuales son la base para identificar firmas mutacionales en los tumores.
+```
+
+The first step to run SigProfilerMatrixGenerator is installing a reference genome, that should match the one used for the alignment of the next generation sequencing data. We have already preinstalled human reference genomes GRCh37.
+
+In order to run SigProfilerMatrixGenerator,you can use the following:
+
+```{r}
+# Generate mutational profiles analysis using SigProfilerMatrixGenerator
+matrices <- SigProfilerMatrixGeneratorR(project = "Pancreas",
+                                        genome = "GRCh37",
+                                        matrix_path = "./signatures/SPMG",
+                                        plot = F,
+                                        exome = T)
+```
+
+
+A successful run will indicate that mutational matrices have been generated for a total of 176 samples and 30835 single base substitutions. 
+
+## 3. Visualizing mutational profiles
+
+For the visualization of SBS96 mutational profiles, we will make use of the SigProfilerPlotting tool. To generate mutational profile plots, we will use the previously generated mutational matrices as input.
+
+```{r}
+# Permite visualizar perfiles de mutaciones generados por SigProfilerMatrixGenerator
+library(SigProfilerPlottingR) 
+
+plotSBS(matrix_path = 'signatures/SPMG/output/SBS/Pancreas.SBS96.exome',
+        output_path = 'signatures/SPMG/output/SBS/',
+        project = 'Pancreas',
+        plot_type = '96',
+        percentage = FALSE)
+```
+
+The file containing the mutational profiles for all samples will be located in the directory specified in the output_path parameter. 
+
+### 3.1 Average mutational profiles
+
+To get an idea of the overall patterns of mutations in the whole cohort, it is useful to generate the average mutational profile of all samples. To do this, it’s important to keep in mind that we need to first obtain the relative mutational matrix, using percentages instead of absolute values. This step is required to avoid samples with high numbers of mutations to bias the average mutational profile.
+
+```{r}
+library(pheatmap)
+library(SigProfilerPlottingR)
+
+# Generate average mutational profiles
+mut_matrix = matrices[['96']]
+
+# Get relative mutational matrix
+relative_mut_matrix = apply(mut_matrix, 2, prop.table)
+
+# Get average mutational matrix
+average_mut_matrix = rowMeans(relative_mut_matrix)
+average_mut_matrix = data.frame(Average_Pancreas = average_mut_matrix)
+
+# Add row names as column and print
+average_mut_matrix_to_print = cbind(rownames(average_mut_matrix),
+                                    average_mut_matrix)
+colnames(average_mut_matrix_to_print)[1] = 'MutationType'
+write.table(average_mut_matrix_to_print, 'signatures/avg_Pancreas.SBS96.all',
+            quote = F, row.names = F, sep = '\t')
+
+# Plot average mutational profiles (note the percentage parameter now)
+plotSBS(matrix_path = 'signatures/avg_Pancreas.SBS96.all',
+        output_path = 'signatures/',
+        project = 'avg_Pancreas',
+        plot_type = '96',
+        percentage = TRUE)
+```
+
+
+### 3.2 Average mutational profiles per subgroup
+
+An interesting analysis when working with large cohorts of cancer cases is to identify differences according to specific subgroups based on clinical characteristics. However, to start working with this metadata, we need to first filter it to use only the samples where we have mutation information.
+
+```{r}
+library(dplyr)  
+# Read clinical file with metadata
+metadata = read.delim('/home/pgodoy/Documents/BioInfoD/Pancreas/paad_tcga_pan_can_atlas_2018_clinical_data.tsv')
+
+# Filtering metadata file to use only samples where we have mutation information
+metadata = metadata %>%
+    filter(Sample.ID %in% maf_sp$Tumor_Sample_Barcode)
+```
+
+```{r}
+# Get samples from group
+samples_group = metadata$Sample.ID
+
+# Select group samples from main matrix and get average, promedio mutacional 
+mm_group = rowMeans(relative_mut_matrix[,samples_group])
+mm_group = data.frame(mm_group)
+
+# Add row names as column and print
+mm_group_to_print = cbind(rownames(mm_group),mm_group)
+colnames(mm_group_to_print) = c('MutationType', 'PAAD_all')
+write.table(mm_group_to_print,
+            'signatures/avg_PAAD.SBS96.all',
+            quote = F, row.names = F, sep = '\t')
+
+# Plot average mutational profiles (note the percentage parameter now)
+plotSBS(matrix_path = 'signatures/avg_PAAD.SBS96.all',
+        output_path = 'signatures/',
+        project = 'avg_PAAD.SBS96.all',
+        plot_type = '96',
+        percentage=TRUE)
+
+```
+
+## 4.Extracting mutational signatures
+
+In order to perform extraction of mutational signatures, we are going to use SigProfilerExtractor, the associated tool from the SigProfiler suite. We will use it to extract de novo mutational signatures from a set of samples and decompose the de novo extracted signatures into COSMIC reference signatures.
+
+Side-note: It is also possible to run SigProfilerExtractor directly from MAF (or VCF) files, without generating a mutational matrix first. In this case, we need to change the input_type parameter to vcf. What is going to happen is that SigProfilerExtractor will call SigProfilerMatrixGenerator internally, and perform the de novo signature extraction after the matrix generation has been finalized. However, when working with a novel dataset, it is always a good practice to first generate mutational matrices and also visualize the mutational profiles to check if there are any particular issues with your data before performing more advanced analysis.
+
+The default and recommended values are nmf_replicates = 100 and maximum_signatures = 25). In particular, the maximum number of signatures will be dependent of the total number of samples in the cohort, and the average number of mutations per sample.
+
+To load the package you can use:
+
+```{r}
+library(SigProfilerExtractorR)
+sigprofilerextractor(input_type = 'matrix',
+                     output = 'signatures/SPE/',
+                     input_data = 'signatures/SPMG/output/SBS/Pancreas.SBS96.exome',
+                     nmf_replicates = 100,
+                     minimum_signatures = 1,
+                     maximum_signatures = 25,
+                     exome = T)
+```
+
+
+## 5. COSMIC reference mutational signatures
+The COSMIC reference set of mutational signatures was derived after the analysis of many thousands of DNA sequenced samples from various cancer types by large international consortia over the last decade (Alexandrov et al. 2013 Nature and Alexandrov et al. 2020 Nature).
+
+These reference mutational signatures have been associated with specific environmental exposures, lifestyle choices, and endogenous cellular mechanisms. More information about the etiologies of the signatures and the cancer types where they have previously been found is available at the COSMIC Mutational Signatures website.
+
+## 6. Assigning reference mutational signatures
+
+Leveraging the COSMIC mutational signatures, we will perform a mutational signature assignment analysis to quantify the number of mutations contributed by each signature to a given cancer sample and, therefore, decipher which mutational processes have been active in each individual tumor. To do this, we will make use of SigProfilerAssignment, the most recent tool of the SigProfiler suite.
+
+In this case, in contrast to the de novo extraction of signatures, we need to provide to SigProfilerAssignment not only the somatic mutations (in the form of a MAF/VCF, or directly using a mutational matrix), but also a set of reference mutational signatures. The COSMIC Mutational Signatures, that we have just reviewed are used as default, but any other set of reference signatures can be used by providing the corresponding signature matrix using the signature_database parameter. A signature matrix should contain as many columns as reference signatures, and as many rows as the specific mutational context (96 in the case of our preferred SBS96 mutational context).
+
+To assign reference signatures to individual samples using SigProfilerAssignment, you can use the code below:
+
+```{r}
+# Load library
+library(SigProfilerAssignmentR)
+
+# Run assignment analysis
+cosmic_fit(samples = 'signatures/SPMG/output/SBS/Pancreas.SBS96.exome',
+           output = 'signatures/SPA',
+           input_type='matrix',
+           exome = T)
+```
+
+
+## 7.Downstream analysis of signature assignment results
+### 7.1 Assessing the accuracy of the signature activities
+
+Assigning mutational signatures is a mathematical optimization problem, which consists in obtaining the best combination of reference signatures that better reconstruct the original mutational profile. Considering this, it is a good practice to check how good is this reconstruction, because it can happen that even if the method tries to optimize the reconstruction, this is still not good enough. Different similarity measures can be used to check this. 
+
+To check the cosine similarity of the reconstruction for some specific samples, we can check the Assignment_Solution_Samples_Stats.txt file, which is inside the directory data/SPA/Assignment_Solution/Solution_Stats. We can do that in R, and generate some useful visualizations:
+
+```{r}
+library(ggplot2)
+stats = read.delim('signatures/SPA/Assignment_Solution/Solution_Stats/Assignment_Solution_Samples_Stats.txt')
+
+ggplot(stats) +
+    aes(x=Cosine.Similarity) +
+    labs(x='')+
+    geom_histogram(aes(y = after_stat(density))) +
+    geom_density(col = 4, lwd = 1.5) +
+    geom_vline(aes(xintercept = 0.9),
+               col = 2, lwd = 1.5) +
+    labs(x = 'Cosine Similarity') +
+    theme_bw()
+```
+
+### 7.2 Visualizing signature activities from SigProfilerAssignment
+
+To visualize the mutational signature assignment results, we will check the plots provided by SigProfilerAssignment (available at signatures/SPA/Assignment_Solution/Activities/).
+
+The TMB plot shows the tumor mutational burden for each signature in each sample. Each dot represents an individual sample and only samples where the signature is found are shown. The numbers below the dots for each cancer type indicate the number of tumours in which mutations were attributed to the signature (above the blue horizontal line) and the total number of tumours analyzed (below the blue horizontal line).
+
+As we can see, a lot of different signatures have been attributed to our pancreas cancer samples, which is commonly a sign of overfitting and poor performance of the method. In this case, especially when we have a large cohort of sample, it is much more benefitial to use the activities generated from signature extraction and then decomposition to COSMIC signatures. This is because the number of COSMIC signatures will be reduced and the assignment process will be more accurate than directly using SigProfilerAssignment.
+
+On the other hand, SigProfilerAssignment it’s really useful in the case that you only have one or a few samples available, because in this scenario de novo extraction of signatures is not possible, since it requires a large number of samples (and mutations).
+
+### 7.3 Visualizing signature activities from SigProfilerExtractor
+Considering what we discussed, we are going to analyze a bit more in detail the signature activities provided by SigProfilerExtractor. It’s important to keep in mind that SigProfilerExtractor is running SigProfilerAssignment automatically for us. However, in this case, the assignment of signatures to samples is done using the de novo extracted signatures, as well as the COSMIC decomposition of these de novo signatures.
+
+We will now generate custom visualizations using ggplot2 and the activities output matrix from the mutational signature assignment analysis.
+
+We can first calculate and plot the average number of mutations contributed by every signatures across the cohort of 176 samples.
+
+```{r}
+# Read activities matrix
+acts = read.delim('/home/pgodoy/Documents/BioInfoD/Pancreas/Pancreas/signatures/SPE/SBS96/Suggested_Solution/COSMIC_SBS96_Decomposed_Solution/Activities/COSMIC_SBS96_Activities.txt')
+
+# Calculate average activities per signature
+avg_acts = colMeans(acts[,-1])
+avg_acts
+
+# Visualize average activities per signature
+barplot(avg_acts)
+
+
+```
+We can also plot the activities for every sample. In this case we are going to plot the relative activities. If we want to plot the absolute activites we need to change the position parameter in geom_bar to position=stack.
+
+```{r}
+# Cargar librerías necesarias
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(RColorBrewer)
+
+# 🔹 **Reformatear el DataFrame para ggplot**
+acts_tidy <- acts %>%
+  pivot_longer(cols = !Samples,
+               names_to = 'Signature',
+               values_to = 'Mutations')
+
+# 🔹 **Ordenar las muestras por contribución total**
+acts_tidy <- acts_tidy %>%
+  group_by(Samples) %>%
+  mutate(TotalMutations = sum(Mutations)) %>%
+  ungroup() %>%
+  arrange(desc(TotalMutations))
+
+# 🔹 **Submuestreo inteligente (opcional, puedes cambiar el número)**
+acts_tidy <- acts_tidy %>%
+  filter(Samples %in% unique(Samples)[1:100])
+
+# 🔹 **Paleta de colores dinámica**
+num_signatures <- length(unique(acts_tidy$Signature))
+color_palette <- colorRampPalette(brewer.pal(8, "Set3"))(num_signatures)
+
+# 🔹 **Graficar el Stacked Barplot mejorado**
+ggplot(acts_tidy) +
+  aes(x = reorder(Samples, -TotalMutations), y = Mutations, fill = Signature) +
+  geom_bar(position = 'fill', stat = 'identity') +
+  scale_fill_manual(values = color_palette) +
+  theme_bw() +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        legend.position = "right",
+        legend.title = element_text(size = 10),
+        legend.text = element_text(size = 8)) +
+  labs(y = "Proportion", title = "Proporción de Firmas COSMIC por Muestra")
+
+```
+
+
+Since we have a lot of samples, the plot above is quite messy and not very useful. We will group the samples according to the metadata groups in the next section, but for now we can plot for example the 10 most mutated cases.
+
+```{r}
+# Calculate number of mutations per sample
+number_of_mutations = rowSums(acts[,-1])
+
+# Selecting the activities of only the top 10 mutated cases
+top_10_mutated_samples = acts[order(number_of_mutations,
+                                    decreasing = T)[1:10],]
+
+# Reformatting and plotting
+top_10_mutated_samples %>%
+     pivot_longer(cols = !Samples,
+                 names_to = 'Signature',
+                 values_to = 'Mutations') %>%
+    ggplot() +
+    aes(x = reorder(Samples, Mutations), y = Mutations, fill = Signature) +
+    geom_bar(position = 'fill', stat = 'identity') +
+    theme_bw() +
+    labs(x = 'Samples')  +
+    theme(axis.title.x=element_blank(),
+          axis.text.x=element_blank(),
+          axis.ticks.x=element_blank())
+```
+### 7.4 Associating signature activities with specific metadata
+As indicating above, common signature analysis in large cohorts of patients include an analysis considering the underlying metadata, in order to answer any specific hypothesis that we may have about the data. In this case, and considering we observed some differences in the mutational profiles according to the molecular subgroups, it would be great to know if there are differences in the signatures assigned to tumor cases from different subgroups.
+
+To do this, we can, for example, calculate the average signature activities per subgroup. This will require a bit of work with the tidyverse collection of packages, which you can see in the code below.
+
+```{r}
+# Merge activities and metadata tables
+# (The samples column needs to be renamed in one of them)
+acts_and_metadata = acts_tidy %>%
+    rename(Sample.ID = Samples) %>%
+    left_join(metadata)
+```
+```{r}
+# Calculate average activities per subtype
+acts_per_subgroup = acts_and_metadata %>%
+    group_by(Subtype, Signature) %>%
+    summarise(Avg_mutations = mean(Mutations))
+head(acts_per_subgroup)
+```
+
+```{r}
+# Selecting only COAD subtypes
+acts_per_subgroup = acts_per_subgroup %>%
+    filter(grepl('PAAD', Subtype))
+
+# Plotting stacked barplot per subtype
+ggplot(acts_per_subgroup) +
+    aes(x = reorder(Subtype, Avg_mutations), y = Avg_mutations, fill = Signature) +
+    geom_bar(position = 'fill', stat = 'identity') +
+    theme_bw() +
+    labs(x = 'Pancreas Cancer',
+         y = 'Average number of mutations')
+```
+
+
+
+
